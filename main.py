@@ -32,7 +32,7 @@ def plot_audio_spectrograms(file_path, output_base_path, cqt_dir):
 # Process all MP3 files in playlist directory
 playlist_dir = 'playlist'
 output_dir = 'output'
-cqt_dir = os.path.join(output_dir, 'cqt-hop64-hpss')
+cqt_dir = os.path.join(output_dir, 'cqt-hop64-hpss-per.freq.median')
 os.makedirs(output_dir, exist_ok=True)
 os.makedirs(cqt_dir, exist_ok=True)
 
