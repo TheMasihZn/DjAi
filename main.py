@@ -14,17 +14,11 @@ def plot_audio_spectrograms(file_path, output_base_path, cqt_dir):
     plt.figure(figsize=size)
     # Separate harmonic and percussive components
     y_harmonic, y_percussive = librosa.effects.hpss(y)
-    C = librosa.cqt(y_harmonic, sr=sr)
-    C_magnitude = np.abs(C)
-
-    # Apply per-frequency median normalization
-    median_magnitudes = np.median(C_magnitude, axis=1, keepdims=True)
-    C_normalized = C_magnitude / median_magnitudes
-    C_db = librosa.amplitude_to_db(C_normalized, ref=np.max)
-
+    C = librosa.cqt(y_harmonic, sr=sr, bins_per_octave=126)
+    C_db = librosa.amplitude_to_db(np.abs(C), ref=np.max)
     librosa.display.specshow(C_db, sr=sr, hop_length=64, x_axis='time', y_axis='cqt_note')
     plt.colorbar(format='%+2.f dB')
-    plt.title('Harmonic Component - Normalized Constant-Q Transform Spectrogram')
+    plt.title('Harmonic Component - Constant-Q Transform Spectrogram')
     plt.savefig(os.path.join(cqt_dir, f"{os.path.basename(output_base_path)}_cqt.jpg"))
     plt.close()
 
@@ -32,7 +26,7 @@ def plot_audio_spectrograms(file_path, output_base_path, cqt_dir):
 # Process all MP3 files in playlist directory
 playlist_dir = 'playlist'
 output_dir = 'output'
-cqt_dir = os.path.join(output_dir, 'cqt-hop64-hpss-per.freq.median')
+cqt_dir = os.path.join(output_dir, 'cqt-hop64-hpss-bpo126')
 os.makedirs(output_dir, exist_ok=True)
 os.makedirs(cqt_dir, exist_ok=True)
 
