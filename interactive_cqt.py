@@ -256,19 +256,28 @@ class InteractiveCQTViewer:
 
         cqt_hop_length = int(self.hpss_hop_length_slider.val)
         cqt_fps = self.sr / cqt_hop_length if self.sr else 44100 / cqt_hop_length
+        total_frames = self.cqt_data_full.shape[1]
 
-        # Recalculate view_width_frames based on the current hop length
         view_width_frames = int(self.view_duration_sec * cqt_fps)
+        view_half_frames = int(view_width_frames / 2)
 
-        # Calculate the start and end frames for the current view
-        view_end_frame = int(current_time * cqt_fps)
-        view_start_frame = max(0, view_end_frame - view_width_frames)
+        current_frame = int(current_time * cqt_fps)
 
-        # Create a buffer filled with the "black" value
-        rolling_buffer = np.full((self.cqt_data_full.shape[0], view_width_frames), -100.0)
+        # Determine the window boundaries so the playhead is centered
+        view_start_frame = max(0, current_frame - view_half_frames)
+        view_end_frame = view_start_frame + view_width_frames
+
+        # Handle the edge case where the window would go past the end of the audio
+        if view_end_frame > total_frames:
+            view_end_frame = total_frames
+            view_start_frame = max(0, view_end_frame - view_width_frames)
 
         # Slice the pre-computed data for the visible portion
         visible_data = self.cqt_data_full[:, view_start_frame:view_end_frame]
+
+        # Create a buffer filled with the "black" value
+        # This handles the case where visible_data is smaller than view_width_frames
+        rolling_buffer = np.full((self.cqt_data_full.shape[0], view_width_frames), -100.0)
 
         # Calculate where to place the visible data in the buffer
         start_col = view_width_frames - visible_data.shape[1]
@@ -278,8 +287,15 @@ class InteractiveCQTViewer:
             self.im.set_data(rolling_buffer)
             self.im.set_clim(-80, 20)
 
-            # Explicitly update the playhead's x-data to ensure it's redrawn correctly
-            self.playhead_line.set_xdata([view_width_frames, view_width_frames])
+            # Calculate playhead position within the new window
+            playhead_pos_in_window = current_frame - view_start_frame
+            self.playhead_line.set_xdata([playhead_pos_in_window, playhead_pos_in_window])
+
+            # Update the x-axis labels to reflect the current time range
+            start_time = view_start_frame / cqt_fps
+            end_time = view_end_frame / cqt_fps
+            self.ax.set_xticks(np.linspace(0, view_width_frames, 5))
+            self.ax.set_xticklabels([f"{t:.1f}s" for t in np.linspace(start_time, end_time, 5)])
 
             self.fig.canvas.draw_idle()
         except Exception as e:
@@ -291,11 +307,7 @@ class InteractiveCQTViewer:
     # --------------------
 
     def _setup_display(self, initial_hop_length):
-        # NOTE: The fig and ax are created in the run() method, so we don't need to do it again here.
-        # This was the cause of the two-window bug.
-
         self.fig.canvas.manager.set_window_title("Interactive CQT: Offline")
-        # plt.subplots_adjust(left=0.08, right=0.92, top=0.90, bottom=0.45) # No need to re-adjust
         self.colorbar_ax = self.fig.add_axes([0.935, 0.47, 0.02, 0.43])
 
         view_width_frames = int(self.view_duration_sec * (44100 / initial_hop_length))
@@ -305,12 +317,12 @@ class InteractiveCQTViewer:
         plt.colorbar(self.im, cax=self.colorbar_ax)
 
         self.ax.set_ylabel("CQT bins")
-        self.ax.set_xlabel(f"Time Window ({self.view_duration_sec}s)")
+        self.ax.set_xlabel("Time")
 
-        self.ax.set_xticks([0, view_width_frames / 2, view_width_frames])
-        self.ax.set_xticklabels([f"-{self.view_duration_sec:.1f}s", f"-{self.view_duration_sec/2:.1f}s", "Playhead"])
+        # Initial playhead is at the center of the window
+        playhead_pos = view_width_frames / 2
+        self.playhead_line = self.ax.axvline(playhead_pos, color="cyan", linewidth=1.5, zorder=10)
 
-        self.playhead_line = self.ax.axvline(view_width_frames, color="cyan", linewidth=1.5, zorder=10)
 
     def _ensure_mixer(self) -> bool:
         if not _HAS_PYGAME: return False
