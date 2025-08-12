@@ -167,6 +167,7 @@ class InteractiveCQTViewer:
 
         self.is_playing = False
         self.is_paused = False
+        self._is_processing = False  # Flag to prevent race conditions
 
         self._is_seeking = False
 
@@ -195,6 +196,7 @@ class InteractiveCQTViewer:
         if not self.current_file:
             return
 
+        self._is_processing = True
         self.ax.set_title("Pre-processing audio... This may take a moment.")
         self.fig.canvas.draw_idle()
 
@@ -226,48 +228,59 @@ class InteractiveCQTViewer:
 
         # Correctly set the slider's maximum value and reset its current position
         if self.seek_slider is not None:
+            self._is_seeking = True
             self.seek_slider.valmax = self.duration_sec
             self.seek_slider.ax.set_xlim(self.seek_slider.valmin, self.seek_slider.valmax)
             self.seek_slider.set_val(0.0) # Reset to the beginning
+            self._is_seeking = False
 
         logger.info("Pre-processing complete. Spectrogram data is ready.")
         self.ax.set_title(
             f"{os.path.basename(self.current_file)} - BPO={int(self.slider.val)}, Hop={int(self.hpss_hop_length_slider.val)}"
         )
+        self._is_processing = False
         self.fig.canvas.draw_idle()
 
     def _update_display(self):
-        """Updates the display based on the playback time and pre-computed data."""
-        if self.im is None or self.fig is None or self.ax is None or self._closing or self.cqt_data_full is None:
+        """
+        Updates the display based on the playback time and pre-computed data.
+        The playhead is now fixed to the right of the viewing window.
+        """
+        if self.im is None or self.fig is None or self.ax is None or self._closing or self.cqt_data_full is None or self._is_processing:
             return
 
         current_time = self._progress_thread.get_time()
+
+        # Clamp current time to the duration of the audio to prevent out-of-bounds indexing
+        current_time = min(current_time, self.duration_sec)
+
         cqt_hop_length = int(self.hpss_hop_length_slider.val)
         cqt_fps = self.sr / cqt_hop_length if self.sr else 44100 / cqt_hop_length
 
-        # Calculate the start and end frames for the current view
-        view_start_time = max(0, current_time - self.view_duration_sec / 2)
-        view_end_time = view_start_time + self.view_duration_sec
-
-        view_start_frame = int(view_start_time * cqt_fps)
-        view_end_frame = int(view_end_time * cqt_fps)
-
-        # We'll use a placeholder until data is ready
+        # Recalculate view_width_frames based on the current hop length
         view_width_frames = int(self.view_duration_sec * cqt_fps)
-        rolling_buffer = np.full((84, view_width_frames), -100.0)
 
-        # Slice the pre-computed data to get the current view
+        # Calculate the start and end frames for the current view
+        view_end_frame = int(current_time * cqt_fps)
+        view_start_frame = max(0, view_end_frame - view_width_frames)
+
+        # Create a buffer filled with the "black" value
+        rolling_buffer = np.full((self.cqt_data_full.shape[0], view_width_frames), -100.0)
+
+        # Slice the pre-computed data for the visible portion
         visible_data = self.cqt_data_full[:, view_start_frame:view_end_frame]
 
-        # Pad with empty data if we are at the end of the file
-        if visible_data.shape[1] < rolling_buffer.shape[1]:
-            rolling_buffer[:, :visible_data.shape[1]] = visible_data
-        else:
-            rolling_buffer = visible_data
+        # Calculate where to place the visible data in the buffer
+        start_col = view_width_frames - visible_data.shape[1]
 
         try:
+            rolling_buffer[:, start_col:] = visible_data
             self.im.set_data(rolling_buffer)
             self.im.set_clim(-80, 20)
+
+            # Explicitly update the playhead's x-data to ensure it's redrawn correctly
+            self.playhead_line.set_xdata([view_width_frames, view_width_frames])
+
             self.fig.canvas.draw_idle()
         except Exception as e:
             logger.warning("Failed to update display: %s", e, exc_info=False)
@@ -277,14 +290,15 @@ class InteractiveCQTViewer:
     # UI and Playback
     # --------------------
 
-    def _init_figure(self):
-        self.fig, self.ax = plt.subplots(figsize=(14, 8))
+    def _setup_display(self, initial_hop_length):
+        # NOTE: The fig and ax are created in the run() method, so we don't need to do it again here.
+        # This was the cause of the two-window bug.
+
         self.fig.canvas.manager.set_window_title("Interactive CQT: Offline")
-        plt.subplots_adjust(left=0.08, right=0.92, top=0.90, bottom=0.45)
+        # plt.subplots_adjust(left=0.08, right=0.92, top=0.90, bottom=0.45) # No need to re-adjust
         self.colorbar_ax = self.fig.add_axes([0.935, 0.47, 0.02, 0.43])
 
-        # We'll use a placeholder until data is ready
-        view_width_frames = int(self.view_duration_sec * (44100 / self.hop_length))
+        view_width_frames = int(self.view_duration_sec * (44100 / initial_hop_length))
         initial_data = np.full((84, view_width_frames), -100.0)
 
         self.im = self.ax.imshow(initial_data, aspect='auto', origin='lower', cmap='magma', animated=True, vmin=-80, vmax=20)
@@ -294,9 +308,9 @@ class InteractiveCQTViewer:
         self.ax.set_xlabel(f"Time Window ({self.view_duration_sec}s)")
 
         self.ax.set_xticks([0, view_width_frames / 2, view_width_frames])
-        self.ax.set_xticklabels([f"-{self.view_duration_sec/2:.1f}s", "Playhead", f"+{self.view_duration_sec/2:.1f}s"])
+        self.ax.set_xticklabels([f"-{self.view_duration_sec:.1f}s", f"-{self.view_duration_sec/2:.1f}s", "Playhead"])
 
-        self.playhead_line = self.ax.axvline(view_width_frames / 2, color="cyan", linewidth=1.5)
+        self.playhead_line = self.ax.axvline(view_width_frames, color="cyan", linewidth=1.5, zorder=10)
 
     def _ensure_mixer(self) -> bool:
         if not _HAS_PYGAME: return False
@@ -408,8 +422,12 @@ class InteractiveCQTViewer:
             return
 
         self._ensure_mixer()
-        self._init_figure()
 
+        # Create figure and axes
+        self.fig, self.ax = plt.subplots(figsize=(14, 8))
+        plt.subplots_adjust(left=0.08, right=0.92, top=0.90, bottom=0.45)
+
+        # Now create sliders and buttons, so they have an axes to attach to
         ax_slider_bpo = self.fig.add_axes([0.08, 0.35, 0.40, 0.025])
         self.slider = Slider(ax=ax_slider_bpo, label="Bins/Octave", valmin=10, valmax=100, valinit=float(initial_bpo), valstep=1)
 
@@ -430,6 +448,9 @@ class InteractiveCQTViewer:
 
         play_ax = self.fig.add_axes([0.5, 0.15, 0.07, 0.04])
         self.play_button = Button(play_ax, "Play" if _HAS_PYGAME else "NoAudio")
+
+        # Now that the sliders and axes exist, set up the initial display
+        self._setup_display(self.hpss_hop_length_slider.val)
 
         self.play_button.on_clicked(self.toggle_play)
         self.slider.on_changed(lambda val: self._trigger_recompute())
