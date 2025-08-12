@@ -168,6 +168,14 @@ class InteractiveCQTViewer:
         self.play_button: Optional[Button] = None
         self.progress_line = None
 
+        # New UI controls for hpss and hop_length
+        self.hpss_kernel_size_slider: Optional[Slider] = None
+        self.hpss_power_slider: Optional[Slider] = None
+        self.hpss_n_fft_slider: Optional[Slider] = None
+        self.hpss_win_length_slider: Optional[Slider] = None
+        self.hpss_hop_length_slider: Optional[Slider] = None
+        self.hpss_margin_button: Optional[Button] = None
+
         # audio
         self.files: List[str] = []
         self.current_file: Optional[str] = None
@@ -175,6 +183,15 @@ class InteractiveCQTViewer:
         self.sr = None
         self.y_harmonic = None
         self.duration_sec = 0.0
+
+        # hpss parameters (now controlled by GUI)
+        self.hpss_kernel_size = 2
+        self.hpss_power = 2.0
+        self.hpss_margin_options = ['hard', 'soft', 'mask']
+        self.hpss_margin_index = 0
+        self.hpss_n_fft = None  # Use None for default
+        self.hpss_win_length = None # Use None for default
+        self.hpss_hop_length = None # Use None for default
 
         # concurrency
         self.worker = AsyncCQTWorker(max_workers=2) if GUI_AVAILABLE else None
@@ -216,26 +233,74 @@ class InteractiveCQTViewer:
     # background tasks (only used when GUI_AVAILABLE)
     # --------------------
     def load_track_async(self, path: str) -> concurrent.futures.Future:
-        def _load(p):
+        """
+        Submits a task to load the audio and apply hpss.
+        """
+        def _load_and_hpss(p, kernel_size, power, margin, n_fft, win_length):
             logger.info("[worker] Loading audio: %s", p)
             # librosa is imported at module level to avoid lazy import inside worker threads during shutdown
-            y, sr = librosa.load(p, sr=None, duration=10, mono=True, res_type="kaiser_best")
-            y_harmonic, _ = librosa.effects.hpss(y, kernel_size=2)
+            y, sr = librosa.load(p, sr=None,
+                                 # duration=5,offset=165,
+                                 mono=True, res_type="kaiser_best")
+
+            # Now using the GUI-controlled parameters for hpss
+            hpss_kwargs = {
+                'kernel_size': int(kernel_size),
+                'power': float(power),
+            }
+            if n_fft is not None:
+                hpss_kwargs['n_fft'] = int(n_fft)
+            if win_length is not None:
+                hpss_kwargs['win_length'] = int(win_length)
+
+            # The following try-except block is a workaround for a potential bug in some versions of librosa
+            # where a TypeError occurs when passing a string 'margin' value. The correct behavior is to accept
+            # the string. If the TypeError occurs, we fall back to a default numeric margin to allow the app
+            # to continue running. It is recommended to update the librosa library if you encounter this error.
+            try:
+                # This is the correct way to pass the margin parameter.
+                hpss_kwargs['margin'] = margin
+                y_harmonic, _ = librosa.effects.hpss(y, **hpss_kwargs)
+            except TypeError:
+                logger.warning(
+                    "Caught TypeError while calling librosa.effects.hpss. "
+                    "This is likely due to an old or buggy version of librosa. "
+                    "Falling back to a default numeric margin. Please consider "
+                    "updating librosa to fix this issue."
+                )
+                # Fallback to a default numeric value if the string-based margin fails
+                hpss_kwargs['margin'] = 1.0 # default numeric value
+                y_harmonic, _ = librosa.effects.hpss(y, **hpss_kwargs)
+
             duration = float(librosa.get_duration(y=y, sr=sr))
             return y, sr, y_harmonic, duration
 
         assert self.worker is not None
-        fut = self.worker.submit(_load, path)
+        fut = self.worker.submit(
+            _load_and_hpss,
+            path,
+            self.hpss_kernel_size,
+            self.hpss_power,
+            self.hpss_margin_options[self.hpss_margin_index],
+            self.hpss_n_fft,
+            self.hpss_win_length
+        )
         self._futures.append(fut)
         return fut
 
-    def compute_and_cache_wide_async(self, y_harmonic: np.ndarray, sr: int, bpo: int, duration_sec: float) -> concurrent.futures.Future:
-        def _task(y_h, sr_, bpo_, dur_):
-            logger.info("[worker] Computing CQT (bpo=%d)", bpo_)
-            C_db = self.cqt.compute_cqt_db(y_h, sr_, bins_per_octave=int(bpo_), hop_length=self.hop_length, n_bins=84)
+    def compute_and_cache_wide_async(self, y_harmonic: np.ndarray, sr: int, bpo: int, hop_length: int, duration_sec: float) -> concurrent.futures.Future:
+        """
+        Submits a task to compute the CQT and save the wide image.
+        Now also uses the GUI-controlled hop_length.
+        """
+        def _task(y_h, sr_, bpo_, hop_length_, dur_):
+            logger.info("[worker] Computing CQT (bpo=%d, hop_length=%d)", bpo_, hop_length_)
+            C_db = self.cqt.compute_cqt_db(y_h, sr_, bins_per_octave=int(bpo_), hop_length=int(hop_length_), n_bins=84)
             vmin = float(np.percentile(C_db, 5.0))
             vmax = float(np.percentile(C_db, 99.5))
-            cache_dir = os.path.join("output", f"cqt-hop{self.hop_length}-hpss-bpo{int(bpo_)}")
+
+            # Update cache directory name to reflect hop_length
+            cache_dir = os.path.join("output", f"cqt-hop{int(hop_length_)}-hpss-bpo{int(bpo_)}")
             os.makedirs(cache_dir, exist_ok=True)
             name = os.path.splitext(os.path.basename(self.current_file))[0] if self.current_file else "track"
             wide_path = os.path.join(cache_dir, f"{name}_wide.jpg")
@@ -261,7 +326,7 @@ class InteractiveCQTViewer:
             return wide_path, vmin, vmax
 
         assert self.worker is not None
-        fut = self.worker.submit(_task, y_harmonic, sr, int(bpo), float(duration_sec))
+        fut = self.worker.submit(_task, y_harmonic, sr, int(bpo), int(hop_length), float(duration_sec))
         self._futures.append(fut)
         return fut
 
@@ -269,13 +334,15 @@ class InteractiveCQTViewer:
     # UI helpers
     # --------------------
     def _init_figure(self):
-        self.fig, self.ax = plt.subplots(figsize=(14, 5.2))
+        # Increased figure height to accommodate new controls
+        self.fig, self.ax = plt.subplots(figsize=(14, 8))
         try:
             self.fig.canvas.manager.set_window_title("Interactive CQT: Async (robust)")
         except Exception:
             pass
-        plt.subplots_adjust(left=0.08, right=0.92, top=0.90, bottom=0.30)
-        self.colorbar_ax = self.fig.add_axes([0.935, 0.32, 0.02, 0.56])
+        # Adjusted bottom margin to make space for the new sliders
+        plt.subplots_adjust(left=0.08, right=0.92, top=0.90, bottom=0.45)
+        self.colorbar_ax = self.fig.add_axes([0.935, 0.47, 0.02, 0.43])
 
     def _draw_placeholder(self, message: str = "Loading..."):
         assert self.ax is not None
@@ -287,7 +354,7 @@ class InteractiveCQTViewer:
             pass
         self._bg_cache = None
 
-    def _plot_wide_image(self, wide_path: str, vmin: float, vmax: float, bpo: int):
+    def _plot_wide_image(self, wide_path: str, vmin: float, vmax: float, bpo: int, hop_length: int):
         assert self.ax is not None
         self.ax.clear()
         try:
@@ -297,7 +364,9 @@ class InteractiveCQTViewer:
             self.ax.set_xlim(0.0, float(self.duration_sec))
             self.ax.set_ylabel("CQT bins")
             self.ax.set_xlabel("Time (s)")
-            self.ax.set_title(f"{os.path.basename(self.current_file)} - Harmonic CQT (bpo={int(bpo)})")
+            self.ax.set_title(
+                f"{os.path.basename(self.current_file)} - Harmonic CQT (bpo={int(bpo)}, hop={int(hop_length)})"
+            )
             try:
                 self.fig.canvas.draw()
             except Exception:
@@ -455,6 +524,119 @@ class InteractiveCQTViewer:
             pass
 
     # --------------------
+    # Recomputation logic
+    # --------------------
+    def _trigger_recompute(self):
+        """
+        Triggers a full re-computation of hpss and CQT.
+        This function is the main entry point for all parameter change callbacks.
+        """
+        if self._closing or self.y is None or self.sr is None:
+            return
+
+        self._draw_placeholder("Recomputing HPSS and CQT...")
+
+        # We need to re-run HPSS first, so we'll start with the load_track_async callback.
+        # This is a bit of a trick, as we're not actually reloading the audio file.
+        # We'll create a new function to just run hpss on the existing audio data.
+        def _recompute_hpss_task(y, sr, kernel_size, power, margin, n_fft, win_length):
+            hpss_kwargs = {
+                'kernel_size': int(kernel_size),
+                'power': float(power),
+            }
+            if n_fft is not None:
+                hpss_kwargs['n_fft'] = int(n_fft)
+            if win_length is not None:
+                hpss_kwargs['win_length'] = int(win_length)
+
+            # The following try-except block is a workaround for a potential bug in some versions of librosa
+            # where a TypeError occurs when passing a string 'margin' value. The correct behavior is to accept
+            # the string. If the TypeError occurs, we fall back to a default numeric margin to allow the app
+            # to continue running. It is recommended to update the librosa library if you encounter this error.
+            try:
+                # This is the correct way to pass the margin parameter.
+                hpss_kwargs['margin'] = margin
+                y_harmonic, _ = librosa.effects.hpss(y, **hpss_kwargs)
+            except TypeError:
+                logger.warning(
+                    "Caught TypeError while calling librosa.effects.hpss. "
+                    "This is likely due to an old or buggy version of librosa. "
+                    "Falling back to a default numeric margin. Please consider "
+                    "updating librosa to fix this issue."
+                )
+                # Fallback to a default numeric value if the string-based margin fails
+                hpss_kwargs['margin'] = (1., 5.) # default numeric value
+                y_harmonic, _ = librosa.effects.hpss(y, **hpss_kwargs)
+            return y_harmonic
+
+        assert self.worker is not None
+        hpss_future = self.worker.submit(
+            _recompute_hpss_task,
+            self.y,
+            self.sr,
+            self.hpss_kernel_size,
+            self.hpss_power,
+            self.hpss_margin_options[self.hpss_margin_index],
+            self.hpss_n_fft,
+            self.hpss_win_length
+        )
+        self._futures.append(hpss_future)
+
+        def _on_hpss_done(hpss_fut: concurrent.futures.Future):
+            if self._closing or hpss_fut.cancelled():
+                return
+            try:
+                self.y_harmonic = hpss_fut.result()
+            except Exception as e:
+                logger.exception("HPSS re-computation failed: %s", e)
+                self._draw_placeholder("Failed to re-compute HPSS")
+                return
+
+            # Now, trigger the CQT computation with the new y_harmonic and hop_length
+            if self.y_harmonic is not None and self.sr is not None and self.duration_sec is not None:
+                fut = self.compute_and_cache_wide_async(
+                    self.y_harmonic,
+                    self.sr,
+                    int(self.slider.val),
+                    int(self.hpss_hop_length_slider.val),
+                    self.duration_sec
+                )
+                # FIX: Added self. to correctly reference the class method
+                fut.add_done_callback(self._on_wide_done)
+
+        hpss_future.add_done_callback(_on_hpss_done)
+
+    def _on_wide_done(self, fut: concurrent.futures.Future):
+        # Guard: if closing or future cancelled -> ignore
+        if self._closing or fut.cancelled():
+            return
+        try:
+            wide_path, vmin, vmax = fut.result()
+        except Exception as e:
+            if self._closing:
+                return
+            logger.exception("Wide compute failed: %s", e)
+            self._draw_placeholder("Failed to compute spectrogram")
+            return
+        self._wide_img_path = wide_path
+        self._vmin_vmax = (vmin, vmax)
+        # Plot on main thread
+        try:
+            self._plot_wide_image(wide_path, vmin, vmax, int(self.slider.val), int(self.hpss_hop_length_slider.val))
+        except Exception:
+            self._draw_placeholder("Failed to draw spectrogram")
+        # create animated progress line
+        try:
+            self.progress_line = self.ax.axvline(0.0, color="cyan", linewidth=1.2, alpha=0.9)
+            try:
+                self.progress_line.set_animated(True)
+            except Exception:
+                pass
+        except Exception:
+            self.progress_line = None
+
+
+    # --------------------
     # Main run
     # --------------------
     def run(self, initial_bpo: int = 10):
@@ -468,7 +650,9 @@ class InteractiveCQTViewer:
             logger.info("Running in synchronous (non-GUI) mode")
             # load audio and compute wide image synchronously
             y, sr = librosa.load(self.current_file, sr=None)
-            y_harmonic, _ = librosa.effects.hpss(y)
+
+            # Using default hpss parameters for synchronous mode
+            y_harmonic, _ = librosa.effects.hpss(y, kernel_size=self.hpss_kernel_size, power=self.hpss_power, margin=self.hpss_margin_options[self.hpss_margin_index])
             duration = float(librosa.get_duration(y=y, sr=sr))
             self.y = y
             self.sr = sr
@@ -513,15 +697,36 @@ class InteractiveCQTViewer:
         self._init_figure()
 
         # controls
-        ax_slider = self.fig.add_axes([0.12, 0.08, 0.78, 0.06])
-        self.slider = Slider(ax=ax_slider, label="Bins per Octave", valmin=10, valmax=100, valinit=float(initial_bpo), valstep=1)
+        # Slider for Bins per Octave (BPO)
+        ax_slider_bpo = self.fig.add_axes([0.08, 0.35, 0.40, 0.025])
+        self.slider = Slider(ax=ax_slider_bpo, label="Bins per Octave", valmin=10, valmax=100, valinit=float(initial_bpo), valstep=1)
+
+        # Sliders for HPSS parameters
+        ax_slider_kernel = self.fig.add_axes([0.08, 0.30, 0.40, 0.025])
+        self.hpss_kernel_size_slider = Slider(ax=ax_slider_kernel, label="HPSS Kernel Size", valmin=1, valmax=100, valinit=2, valstep=1)
+
+        ax_slider_power = self.fig.add_axes([0.08, 0.25, 0.40, 0.025])
+        self.hpss_power_slider = Slider(ax=ax_slider_power, label="HPSS Power", valmin=1.0, valmax=100.0, valinit=2.0, valstep=0.1)
+
+        ax_slider_hop = self.fig.add_axes([0.08, 0.20, 0.40, 0.025])
+        self.hpss_hop_length_slider = Slider(ax=ax_slider_hop, label="Hop Length (CQT)", valmin=32, valmax=1024, valinit=self.hop_length, valstep=32)
+
+        ax_slider_n_fft = self.fig.add_axes([0.08, 0.15, 0.40, 0.025])
+        self.hpss_n_fft_slider = Slider(ax=ax_slider_n_fft, label="N_FFT (HPSS)", valmin=512, valmax=8192, valinit=2048, valstep=256)
+
+        ax_slider_win_length = self.fig.add_axes([0.08, 0.10, 0.40, 0.025])
+        self.hpss_win_length_slider = Slider(ax=ax_slider_win_length, label="Win Length (HPSS)", valmin=512, valmax=8192, valinit=2048, valstep=256)
+
+        # Button for HPSS margin type
+        ax_button_margin = self.fig.add_axes([0.5, 0.35, 0.1, 0.04])
+        self.hpss_margin_button = Button(ax_button_margin, f"Margin: {self.hpss_margin_options[self.hpss_margin_index]}")
 
         # seek slider
-        self.seek_ax = self.fig.add_axes([0.12, 0.18, 0.78, 0.06])
+        self.seek_ax = self.fig.add_axes([0.5, 0.25, 0.40, 0.04])
         self.seek_slider = Slider(ax=self.seek_ax, label="Seek (s)", valmin=0.0, valmax=1.0, valinit=0.0, valstep=0.01)
 
         # play button
-        play_ax = self.fig.add_axes([0.03, 0.08, 0.07, 0.06])
+        play_ax = self.fig.add_axes([0.5, 0.15, 0.07, 0.04])
         lbl = "Play" if _HAS_PYGAME else "NoAudio"
         self.play_button = Button(play_ax, lbl)
         self.play_button.on_clicked(self.toggle_play)
@@ -532,35 +737,7 @@ class InteractiveCQTViewer:
         # submit audio load
         load_future = self.load_track_async(self.current_file)
 
-        def _on_wide_done(fut: concurrent.futures.Future):
-            # Guard: if closing or future cancelled -> ignore
-            if self._closing or fut.cancelled():
-                return
-            try:
-                wide_path, vmin, vmax = fut.result()
-            except Exception as e:
-                if self._closing:
-                    return
-                logger.exception("Wide compute failed: %s", e)
-                self._draw_placeholder("Failed to compute spectrogram")
-                return
-            self._wide_img_path = wide_path
-            self._vmin_vmax = (vmin, vmax)
-            # Plot on main thread
-            try:
-                self._plot_wide_image(wide_path, vmin, vmax, int(self.slider.val))
-            except Exception:
-                self._draw_placeholder("Failed to draw spectrogram")
-            # create animated progress line
-            try:
-                self.progress_line = self.ax.axvline(0.0, color="cyan", linewidth=1.2, alpha=0.9)
-                try:
-                    self.progress_line.set_animated(True)
-                except Exception:
-                    pass
-            except Exception:
-                self.progress_line = None
-
+        # Callback for when HPSS and CQT computation is complete
         def _on_load_done(fut: concurrent.futures.Future):
             # Guard: if closing or cancelled -> ignore
             if self._closing or fut.cancelled():
@@ -585,22 +762,55 @@ class InteractiveCQTViewer:
             except Exception:
                 pass
             # submit wide image compute
-            fut2 = self.compute_and_cache_wide_async(self.y_harmonic, self.sr, int(self.slider.val), self.duration_sec)
-            fut2.add_done_callback(_on_wide_done)
+            fut2 = self.compute_and_cache_wide_async(
+                self.y_harmonic,
+                self.sr,
+                int(self.slider.val),
+                int(self.hpss_hop_length_slider.val),
+                self.duration_sec
+            )
+            fut2.add_done_callback(self._on_wide_done)
 
         load_future.add_done_callback(_on_load_done)
 
-        # bins slider callback -> recompute wide image in background
-        def _on_bins_change(val):
-            if self._closing:
+        # Bins slider callback -> recompute wide image in background
+        def _on_bpo_change(val):
+            if self._closing or self.y_harmonic is None:
                 return
             self._draw_placeholder("Recomputing CQT...")
-            if self.y_harmonic is None:
-                return
-            fut = self.compute_and_cache_wide_async(self.y_harmonic, self.sr, int(val), self.duration_sec)
-            fut.add_done_callback(_on_wide_done)
+            fut = self.compute_and_cache_wide_async(
+                self.y_harmonic,
+                self.sr,
+                int(val),
+                int(self.hpss_hop_length_slider.val),
+                self.duration_sec
+            )
+            fut.add_done_callback(self._on_wide_done)
 
-        self.slider.on_changed(_on_bins_change)
+        self.slider.on_changed(_on_bpo_change)
+
+        # HPSS parameter callbacks -> trigger full recompute
+        def _on_hpss_param_change(val):
+            self.hpss_kernel_size = int(self.hpss_kernel_size_slider.val)
+            self.hpss_power = float(self.hpss_power_slider.val)
+            self.hpss_n_fft = int(self.hpss_n_fft_slider.val)
+            self.hpss_win_length = int(self.hpss_win_length_slider.val)
+            self.hop_length = int(self.hpss_hop_length_slider.val)
+            self._trigger_recompute()
+
+        self.hpss_kernel_size_slider.on_changed(_on_hpss_param_change)
+        self.hpss_power_slider.on_changed(_on_hpss_param_change)
+        self.hpss_n_fft_slider.on_changed(_on_hpss_param_change)
+        self.hpss_win_length_slider.on_changed(_on_hpss_param_change)
+        self.hpss_hop_length_slider.on_changed(_on_hpss_param_change)
+
+        def _on_margin_button_click(event):
+            self.hpss_margin_index = (self.hpss_margin_index + 1) % len(self.hpss_margin_options)
+            self.hpss_margin_button.label.set_text(f"Margin: {self.hpss_margin_options[self.hpss_margin_index]}")
+            self._trigger_recompute()
+
+        self.hpss_margin_button.on_clicked(_on_margin_button_click)
+
 
         # seek handling
         _user_dragging = {"flag": False}
