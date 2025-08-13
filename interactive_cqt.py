@@ -257,10 +257,19 @@ class InteractiveCQTViewer:
 
         if self.seek_slider is not None:
             self._is_seeking = True
-            self.seek_slider.valmax = self.duration_sec
-            self.seek_slider.ax.set_xlim(self.seek_slider.valmin, self.seek_slider.valmax)
-            self.seek_slider.set_val(0.0)
-            self._is_seeking = False
+            try:
+                self.seek_slider.valmax = self.duration_sec
+                self.seek_slider.ax.set_xlim(self.seek_slider.valmin, self.seek_slider.valmax)
+                # Preserve current time if available
+                t_restore = 0.0
+                try:
+                    t_restore = float(self._progress_thread.get_time()) if GUI_AVAILABLE else 0.0
+                except Exception:
+                    t_restore = 0.0
+                t_restore = max(0.0, min(float(t_restore), float(self.duration_sec)))
+                self.seek_slider.set_val(t_restore)
+            finally:
+                self._is_seeking = False
 
         logger.info("Pre-processing complete for two files. Spectrogram data ready.")
         base_a = os.path.basename(self.tracks[0]['file'])
@@ -565,12 +574,57 @@ class InteractiveCQTViewer:
             return
         logger.info("Parameters changed. Triggering a full re-compute.")
 
-        # We perform a full stop, including resetting the progress time
-        self._stop_playback()
-        if GUI_AVAILABLE:
-            self._progress_thread.set_time(0.0)
+        # Remember current playback time and state
+        try:
+            cur_time = self.seek_slider.val if self.seek_slider is not None else 0.0
+        except Exception:
+            cur_time = 0.0
+        if GUI_AVAILABLE and cur_time == 0.0:
+            try:
+                cur_time = float(self._progress_thread.get_time())
+            except Exception:
+                pass
+        was_playing = bool(self.is_playing and not self.is_paused)
+        was_paused = bool(self.is_paused)
 
+        # Stop playback without resetting time
+        self._stop_playback()
+
+        # Recompute
         self._pre_process_audio()
+
+        # Clamp time to new duration and restore
+        cur_time = max(0.0, min(float(cur_time), float(self.duration_sec)))
+        if GUI_AVAILABLE:
+            try:
+                self._progress_thread.set_time(cur_time)
+            except Exception:
+                pass
+        if self.seek_slider is not None:
+            self._is_seeking = True
+            try:
+                # Ensure slider max reflects new duration before setting value
+                self.seek_slider.valmax = self.duration_sec
+                self.seek_slider.ax.set_xlim(self.seek_slider.valmin, self.seek_slider.valmax)
+                self.seek_slider.set_val(cur_time)
+            finally:
+                self._is_seeking = False
+
+        # Resume playback if it was playing before
+        if was_playing:
+            self._play_current(start_sec=cur_time)
+            if self.play_button:
+                self.play_button.label.set_text("Pause")
+        else:
+            # Maintain button label consistent with paused/stopped state
+            if self.play_button:
+                if was_paused:
+                    self.play_button.label.set_text("Resume")
+                else:
+                    self.play_button.label.set_text("Play")
+
+        # Update the display
+        self._update_display()
 
 
     # --------------------
