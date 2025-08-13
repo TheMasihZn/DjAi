@@ -66,7 +66,7 @@ if not GUI_AVAILABLE:
 
 class PlaybackProgressThread(threading.Thread):
     """Minimal playback poller for pygame playback position."""
-    def __init__(self, interval: float = 0.02):
+    def __init__(self, interval: float = 0.01): # Changed interval to 0.01s
         super().__init__(daemon=True, name="PlaybackProgressThread")
         self.interval = interval
         self._stop = threading.Event()
@@ -125,7 +125,7 @@ class InteractiveCQTViewer:
             self,
             playlist_dir: str = "playlist",
             cqt_computer: Optional[CQTComputer] = None,
-            gui_fps: int = 60,
+            gui_fps: int = 100, # Changed GUI frames per second to 100
             view_duration_sec: int = 10,
     ):
         self.playlist_dir = playlist_dir
@@ -334,6 +334,10 @@ class InteractiveCQTViewer:
             return False
 
     def _stop_playback(self):
+        """
+        Stops the playback but does not reset the progress time.
+        This allows for seamless resuming after a seek.
+        """
         if _HAS_PYGAME and pygame.mixer.get_init():
             try:
                 if pygame.mixer.music.get_busy():
@@ -346,12 +350,6 @@ class InteractiveCQTViewer:
         if GUI_AVAILABLE:
             self._progress_thread.set_playing(False)
             self._progress_thread.set_paused(False)
-            self._progress_thread.set_time(0.0)
-
-        if self.seek_slider is not None:
-            self._is_seeking = True
-            self.seek_slider.set_val(0.0)
-            self._is_seeking = False
 
     def _play_current(self, start_sec: float = 0.0):
         if self.cqt_data_full is None:
@@ -362,6 +360,8 @@ class InteractiveCQTViewer:
             logger.info("pygame not available; cannot play audio")
             return
 
+        # Stop any existing playback before starting a new one.
+        # This will NOT reset the progress thread's time anymore.
         self._stop_playback()
 
         try:
@@ -378,8 +378,11 @@ class InteractiveCQTViewer:
 
     def toggle_play(self, event=None):
         if not _HAS_PYGAME or self.cqt_data_full is None: return
+
+        # Get the timestamp directly from the seek slider
+        t = self.seek_slider.val if self.seek_slider is not None else 0.0
+
         if not self.is_playing:
-            t = self._progress_thread.get_time() if GUI_AVAILABLE else 0.0
             self._play_current(start_sec=t)
             if self.play_button: self.play_button.label.set_text("Pause")
         else:
@@ -389,10 +392,12 @@ class InteractiveCQTViewer:
                 if GUI_AVAILABLE: self._progress_thread.set_paused(True)
                 if self.play_button: self.play_button.label.set_text("Resume")
             else:
-                pygame.mixer.music.unpause()
-                self.is_paused = False
-                if GUI_AVAILABLE: self._progress_thread.set_paused(False)
+                # The user is resuming after seeking while paused.
+                # The _apply_seek function already set the new time in the progress thread.
+                # We need to restart playback from that new position.
+                self._play_current(start_sec=t)
                 if self.play_button: self.play_button.label.set_text("Pause")
+
 
     def _apply_seek(self, t_sec: float):
         if self._is_seeking or self.cqt_data_full is None:
@@ -402,21 +407,25 @@ class InteractiveCQTViewer:
         if GUI_AVAILABLE:
             self._progress_thread.set_time(t_sec)
 
+        # Explicitly update the display here to prevent lag
+        self._update_display()
+
         logger.info("Seeking to %.2f s. No recompute needed.", t_sec)
 
-        if self.is_playing and _HAS_PYGAME:
-            pygame.mixer.music.stop()
-            pygame.mixer.music.load(self.current_file)
-            pygame.mixer.music.play(start=t_sec)
-            if self.is_paused:
-                pygame.mixer.music.pause()
+        # Do not start/stop playback here. This is a state update, not a playback command.
+        # The toggle_play function will handle starting playback if needed.
 
     def _trigger_recompute(self):
         """Called when parameters are changed to trigger a full re-processing."""
         if self._closing:
             return
         logger.info("Parameters changed. Triggering a full re-compute.")
+
+        # We perform a full stop, including resetting the progress time
         self._stop_playback()
+        if GUI_AVAILABLE:
+            self._progress_thread.set_time(0.0)
+
         self._pre_process_audio()
 
 
@@ -441,16 +450,16 @@ class InteractiveCQTViewer:
 
         # Now create sliders and buttons, so they have an axes to attach to
         ax_slider_bpo = self.fig.add_axes([0.08, 0.35, 0.40, 0.025])
-        self.slider = Slider(ax=ax_slider_bpo, label="Bins/Octave", valmin=10, valmax=100, valinit=float(initial_bpo), valstep=1)
+        self.slider = Slider(ax=ax_slider_bpo, label="Bins/Octave", valmin=10, valmax=48, valinit=float(initial_bpo), valstep=1)
 
         ax_slider_kernel = self.fig.add_axes([0.08, 0.30, 0.40, 0.025])
-        self.hpss_kernel_size_slider = Slider(ax=ax_slider_kernel, label="HPSS Kernel", valmin=1, valmax=100, valinit=self.hpss_kernel_size, valstep=2)
+        self.hpss_kernel_size_slider = Slider(ax=ax_slider_kernel, label="HPSS Kernel", valmin=1, valmax=84, valinit=self.hpss_kernel_size, valstep=2)
 
         ax_slider_power = self.fig.add_axes([0.08, 0.25, 0.40, 0.025])
-        self.hpss_power_slider = Slider(ax=ax_slider_power, label="HPSS Power", valmin=1.0, valmax=100.0, valinit=self.hpss_power, valstep=0.1)
+        self.hpss_power_slider = Slider(ax=ax_slider_power, label="HPSS Power", valmin=1.0, valmax=3.0, valinit=self.hpss_power, valstep=0.1)
 
         ax_slider_hop = self.fig.add_axes([0.08, 0.20, 0.40, 0.025])
-        self.hpss_hop_length_slider = Slider(ax=ax_slider_hop, label="Hop Length", valmin=64, valmax=1024, valinit=self.hop_length, valstep=64)
+        self.hpss_hop_length_slider = Slider(ax=ax_slider_hop, label="Hop Length", valmin=16, valmax=512, valinit=self.hop_length, valstep=8)
 
         ax_button_margin = self.fig.add_axes([0.5, 0.35, 0.1, 0.04])
         self.hpss_margin_button = Button(ax_button_margin, f"Margin: {self.hpss_margin_options[self.hpss_margin_index]}")
@@ -511,4 +520,4 @@ class InteractiveCQTViewer:
 
 if __name__ == "__main__":
     viewer = InteractiveCQTViewer(playlist_dir="playlist")
-    viewer.run(initial_bpo=24)
+    viewer.run(initial_bpo=12)
