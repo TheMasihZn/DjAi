@@ -62,27 +62,63 @@ def _gpu_cqt_db(y_harmonic: np.ndarray, sr: int, bins_per_octave: int, hop_lengt
         # torchaudio CQT transform
         # Match librosa default fmin ~ C1 ~ 32.703 Hz
         fmin = 32.703195662574764
-        # Some torchaudio versions do not provide transforms.CQT. Guard before constructing.
-        if not hasattr(getattr(torchaudio, "transforms", object()), "CQT"):
+        # Build a CQT-like transform compatible with multiple torchaudio versions (including 2.5.1)
+        ta_trans = getattr(torchaudio, "transforms", None)
+        if ta_trans is None:
             if _ACCEL_LOG:
-                print("[ACCEL] torchaudio.transforms.CQT not available in this torchaudio version; skipping GPU CQT.")
-            return None, False
-        try:
-            cqt = torchaudio.transforms.CQT(
-                sample_rate=sr,
-                hop_length=hop_length,
-                fmin=fmin,
-                n_bins=n_bins,
-                bins_per_octave=bins_per_octave,
-                pad_mode="reflect",
-            )
-        except Exception as e:
-            if _ACCEL_LOG:
-                print(f"[ACCEL] Failed to construct torchaudio CQT: {e}")
+                print("[ACCEL] torchaudio.transforms not present; skipping GPU CQT.")
             return None, False
 
-        # Ensure the module runs on GPU
-        cqt = cqt.to(device)
+        cqt = None
+        base_kwargs = dict(
+            sample_rate=sr,
+            hop_length=hop_length,
+            fmin=fmin,
+            n_bins=n_bins,
+            bins_per_octave=bins_per_octave,
+        )
+        kwarg_variants = [
+            {**base_kwargs, "pad_mode": "reflect"},
+            {**base_kwargs},
+            {**base_kwargs, "center": True},
+            {**base_kwargs, "center": True, "trainable": False},
+        ]
+        chosen_name = None
+        for name in ("CQT", "CQT1992v2", "CQT1992", "VQT"):
+            if hasattr(ta_trans, name):
+                cls = getattr(ta_trans, name)
+                for kw in kwarg_variants:
+                    try:
+                        cqt_candidate = cls(**kw)
+                        cqt = cqt_candidate
+                        chosen_name = name
+                        if _ACCEL_LOG:
+                            print(f"[ACCEL] Using torchaudio.transforms.{name} with kwargs {list(kw.keys())}.")
+                        break
+                    except Exception as e:
+                        if _ACCEL_LOG:
+                            print(f"[ACCEL] Failed to construct torchaudio.transforms.{name} with {list(kw.keys())}: {e}")
+                        cqt = None
+                        continue
+            if cqt is not None:
+                break
+        if cqt is None:
+            if _ACCEL_LOG:
+                print("[ACCEL] No compatible torchaudio CQT/VQT transform available; skipping GPU CQT.")
+            return None, False
+
+        # Ensure the module runs on GPU if possible; otherwise determine its device
+        module_device = torch.device("cpu")
+        try:
+            cqt = cqt.to(device)
+            module_device = device
+        except Exception:
+            try:
+                first_param = next(cqt.parameters(), None)
+                if first_param is not None:
+                    module_device = first_param.device
+            except Exception:
+                module_device = torch.device("cpu")
 
         try:
             torch.backends.cudnn.benchmark = True
@@ -90,16 +126,33 @@ def _gpu_cqt_db(y_harmonic: np.ndarray, sr: int, bins_per_octave: int, hop_lengt
             pass
 
         with torch.no_grad():
-            # Input expected shape (..., time); 1D is acceptable
-            C = cqt(y_t)  # shape: (freq, time)
+            # Align input to module device
+            x = y_t
+            if str(module_device) != str(x.device):
+                try:
+                    x = y_t.to(module_device)
+                except Exception:
+                    x = y_t
+            # Ensure shape (..., time)
+            squeeze_back = False
+            if x.dim() == 1:
+                x = x.unsqueeze(0)
+                squeeze_back = True
+            C = cqt(x)
+            if C.dim() == 3 and squeeze_back:
+                C = C.squeeze(0)
+            # Move to GPU for dB math if possible
+            try:
+                C = C.to(device)
+            except Exception:
+                pass
             mag = torch.abs(C)
-            # Compute dB scaling similar to librosa.amplitude_to_db with ref=np.max
             eps = torch.finfo(mag.dtype).tiny
             ref = torch.max(mag).clamp_min(eps)
             C_db = 20.0 * torch.log10((mag / ref).clamp_min(eps))
             C_db_np = C_db.detach().cpu().numpy()
             if _ACCEL_LOG:
-                print(f"[ACCEL] CQT computed on GPU ({device}). Output shape: {C_db_np.shape}")
+                print(f"[ACCEL] CQT computed via torchaudio ({chosen_name}). Output shape: {C_db_np.shape}")
             return C_db_np, True
     except Exception as e:
         if _ACCEL_LOG:

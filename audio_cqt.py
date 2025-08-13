@@ -98,40 +98,102 @@ class CQTComputer:
             # prepare tensor on GPU
             y_t = torch.as_tensor(y_harmonic, dtype=torch.float32, device=device)
             fmin = 32.703195662574764  # consistent with librosa behavior in original code
-            # Some torchaudio versions do not provide transforms.CQT. Guard before constructing.
-            if not hasattr(getattr(torchaudio, "transforms", object()), "CQT"):
+            # Build a CQT-like transform compatible with multiple torchaudio versions (2.5.1+ included)
+            ta_trans = getattr(torchaudio, "transforms", None)
+            if ta_trans is None:
                 if self.accel_log:
-                    logger.info("torchaudio.transforms.CQT not available in this torchaudio version; skipping GPU CQT.")
-                return None, False
-            try:
-                cqt = torchaudio.transforms.CQT(
-                    sample_rate=sr,
-                    hop_length=hop_length,
-                    fmin=fmin,
-                    n_bins=n_bins,
-                    bins_per_octave=bins_per_octave,
-                    pad_mode="reflect",
-                )
-            except Exception as e:
-                if self.accel_log:
-                    logger.info("Failed to construct torchaudio CQT: %s", e)
+                    logger.info("torchaudio.transforms not present; skipping GPU CQT.")
                 return None, False
 
-            cqt = cqt.to(device)
+            cqt = None
+            base_kwargs = dict(
+                sample_rate=sr,
+                hop_length=hop_length,
+                fmin=fmin,
+                n_bins=n_bins,
+                bins_per_octave=bins_per_octave,
+            )
+            # Try multiple kwarg variants to satisfy differing signatures across versions
+            kwarg_variants = [
+                {**base_kwargs, "pad_mode": "reflect"},
+                {**base_kwargs},
+                {**base_kwargs, "center": True},
+                {**base_kwargs, "center": True, "trainable": False},
+            ]
+            chosen_name = None
+            # Try known class names across torchaudio versions
+            for name in ("CQT", "CQT1992v2", "CQT1992", "VQT"):
+                if not hasattr(ta_trans, name):
+                    continue
+                cls = getattr(ta_trans, name)
+                for kw in kwarg_variants:
+                    try:
+                        cqt_candidate = cls(**kw)
+                        cqt = cqt_candidate
+                        chosen_name = name
+                        if self.accel_log:
+                            logger.info("Using torchaudio.transforms.%s with kwargs=%s for GPU CQT.", name, list(kw.keys()))
+                        break
+                    except Exception as e:
+                        if self.accel_log:
+                            logger.info("Failed to construct torchaudio.transforms.%s with kwargs %s: %s", name, list(kw.keys()), e)
+                        cqt = None
+                        continue
+                if cqt is not None:
+                    break
+
+            if cqt is None:
+                if self.accel_log:
+                    logger.info("No compatible torchaudio CQT/VQT transform available; skipping GPU CQT.")
+                return None, False
+
+            # Ensure the module runs on GPU if possible; otherwise note its device
+            module_device = torch.device("cpu")
+            try:
+                cqt = cqt.to(device)
+                module_device = device
+            except Exception:
+                # Some versions might not support .to on the transform; infer device from parameters if any
+                try:
+                    first_param = next(cqt.parameters(), None)
+                    if first_param is not None:
+                        module_device = first_param.device
+                except Exception:
+                    module_device = torch.device("cpu")
             try:
                 torch.backends.cudnn.benchmark = True
             except Exception:
                 pass
 
             with torch.no_grad():
-                C = cqt(y_t)  # shape: (freq, time)
+                # Match input device to module
+                x = y_t
+                if str(module_device) != str(x.device):
+                    try:
+                        x = y_t.to(module_device)
+                    except Exception:
+                        x = y_t
+                # Ensure expected shape (..., time). Some versions prefer (batch, time)
+                squeeze_back = False
+                if x.dim() == 1:
+                    x = x.unsqueeze(0)
+                    squeeze_back = True
+                C = cqt(x)
+                # Handle possible (batch, freq, time) output
+                if C.dim() == 3 and squeeze_back:
+                    C = C.squeeze(0)
+                # Move to GPU (if available) for dB scaling to keep math accelerated
+                try:
+                    C = C.to(device)
+                except Exception:
+                    pass
                 mag = torch.abs(C)
                 eps = torch.finfo(mag.dtype).tiny
                 ref = torch.max(mag).clamp_min(eps)
                 C_db = 20.0 * torch.log10((mag / ref).clamp_min(eps))
                 C_db_np = C_db.detach().cpu().numpy()
                 if self.accel_log:
-                    logger.info("CQT computed on GPU, output shape: %s", str(C_db_np.shape))
+                    logger.info("CQT computed via torchaudio (%s), output shape: %s", str(chosen_name), str(C_db_np.shape))
                 return C_db_np, True
         except Exception as e:
             if self.accel_log:
