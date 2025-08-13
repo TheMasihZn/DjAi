@@ -65,8 +65,8 @@ if not GUI_AVAILABLE:
 
 
 class PlaybackProgressThread(threading.Thread):
-    """Minimal playback poller for pygame playback position."""
-    def __init__(self, interval: float = 0.01): # Changed interval to 0.01s
+    """Playback clock thread that tracks time independently of the audio backend."""
+    def __init__(self, interval: float = 0.01): # 10 ms
         super().__init__(daemon=True, name="PlaybackProgressThread")
         self.interval = interval
         self._stop = threading.Event()
@@ -74,28 +74,23 @@ class PlaybackProgressThread(threading.Thread):
         self._time_sec = 0.0
         self._is_playing = False
         self._is_paused = False
+        self._last_tick = None  # type: Optional[float]
 
     def run(self):
         while not self._stop.is_set():
             try:
-                if _HAS_PYGAME and pygame.mixer.get_init() and self._is_playing and not self._is_paused:
-                    try:
-                        pos_ms = pygame.mixer.music.get_pos()
-                        if pos_ms is not None and pos_ms >= 0:
-                            t = float(pos_ms) / 1000.0
-                        else:
-                            t = self._time_sec
-                            if self._is_playing:
-                                logger.info("Playback seems to have stopped, resetting position.")
-                                self._is_playing = False
-                                self._time_sec = 0.0
-                                continue
-                    except Exception:
-                        t = self._time_sec
-                else:
-                    t = self._time_sec
                 with self._lock:
-                    self._time_sec = t
+                    if self._is_playing and not self._is_paused:
+                        now = time.perf_counter()
+                        if self._last_tick is None:
+                            self._last_tick = now
+                        dt = now - self._last_tick
+                        self._last_tick = now
+                        self._time_sec += float(dt)
+                    else:
+                        # Not playing or paused: reset last tick so we don't accumulate a big dt later
+                        self._last_tick = None
+                
             except Exception:
                 pass
             time.sleep(self.interval)
@@ -106,6 +101,7 @@ class PlaybackProgressThread(threading.Thread):
     def set_time(self, t: float):
         with self._lock:
             self._time_sec = float(t)
+            self._last_tick = time.perf_counter() if self._is_playing and not self._is_paused else None
 
     def get_time(self) -> float:
         with self._lock:
@@ -114,10 +110,12 @@ class PlaybackProgressThread(threading.Thread):
     def set_playing(self, playing: bool):
         with self._lock:
             self._is_playing = bool(playing)
+            self._last_tick = time.perf_counter() if self._is_playing and not self._is_paused else None
 
     def set_paused(self, paused: bool):
         with self._lock:
             self._is_paused = bool(paused)
+            self._last_tick = time.perf_counter() if self._is_playing and not self._is_paused else None
 
 
 class InteractiveCQTViewer:
@@ -134,11 +132,28 @@ class InteractiveCQTViewer:
 
         self.view_duration_sec = float(view_duration_sec)
 
-        self.cqt_data_full = None  # This will hold the full pre-computed CQT
+        # Two-track data containers
+        self.tracks = [
+            {
+                'file': None,          # type: Optional[str]
+                'sr': None,            # type: Optional[int]
+                'y_full': None,        # type: Optional[np.ndarray]
+                'duration': 0.0,       # type: float
+                'cqt': None            # type: Optional[np.ndarray]
+            },
+            {
+                'file': None,
+                'sr': None,
+                'y_full': None,
+                'duration': 0.0,
+                'cqt': None
+            }
+        ]
 
         self.fig: Optional[plt.Figure] = None
         self.ax: Optional[plt.Axes] = None
-        self.im: Optional[plt.imshow] = None
+        self.im1: Optional[plt.imshow] = None
+        self.im2: Optional[plt.imshow] = None
         self.playhead_line = None
         self.colorbar_ax: Optional[plt.Axes] = None
         self.slider: Optional[Slider] = None
@@ -151,13 +166,14 @@ class InteractiveCQTViewer:
         self.hpss_margin_button: Optional[Button] = None
 
         self.files: List[str] = []
-        self.current_file: Optional[str] = None
+        self.current_file: Optional[str] = None  # kept for compatibility, points to last file
         self.sr: Optional[int] = None
-        self.duration_sec: float = 0.0
+        self.duration_sec: float = 0.0  # max duration across tracks
 
         self.hpss_kernel_size = 2
         self.hpss_power = 2.0
-        self.hpss_margin_options = ['hard', 'soft', 'mask']
+        # Use numeric margins by default for librosa HPSS to avoid TypeError with string-based options
+        self.hpss_margin_options = [1.0, 1.5, 2.0]
         self.hpss_margin_index = 0
 
         self._closing = False
@@ -173,6 +189,11 @@ class InteractiveCQTViewer:
 
         self._gui_interval_ms = int(max(1, round(1000.0 / float(gui_fps))))
         self._timer: Optional[plt.Timer] = None
+
+        # Audio playback (mixed) state
+        self._channel = None  # type: Optional[object]
+        self._current_sound = None  # type: Optional[object]
+        self._mix_sr = None  # type: Optional[int]
 
     # --------------------
     # filesystem helpers
@@ -192,51 +213,60 @@ class InteractiveCQTViewer:
     # --------------------------------
 
     def _pre_process_audio(self):
-        """Pre-processes the entire audio file to generate the CQT spectrogram."""
-        if not self.current_file:
+        """Pre-process the last two audio files to generate CQT spectrograms for both."""
+        if not self.tracks[0]['file'] or not self.tracks[1]['file']:
             return
 
         self._is_processing = True
-        self.ax.set_title("Pre-processing audio... This may take a moment.")
+        self.ax.set_title("Pre-processing 2 audio files... This may take a moment.")
         self.fig.canvas.draw_idle()
 
-        y_full, self.sr = librosa.load(self.current_file, sr=None, mono=True, res_type="kaiser_best")
+        # Process both tracks sequentially (simpler and safe for memory)
+        for i in range(2):
+            path = self.tracks[i]['file']
+            y_full, sr = librosa.load(path, sr=None, mono=True, res_type="kaiser_best")
+            self.tracks[i]['y_full'] = y_full
+            self.tracks[i]['sr'] = sr
+            self.tracks[i]['duration'] = librosa.get_duration(y=y_full, sr=sr)
 
-        # HPSS is performed on the entire audio file
-        hpss_kwargs = {
-            'kernel_size': int(self.hpss_kernel_size_slider.val),
-            'power': float(self.hpss_power_slider.val),
-        }
-        try:
-            hpss_kwargs['margin'] = self.hpss_margin_options[self.hpss_margin_index]
-            y_harmonic, _ = librosa.effects.hpss(y_full, **hpss_kwargs)
-        except TypeError:
-            logger.warning("Caught TypeError with string-based HPSS margin... Falling back to numeric.")
-            hpss_kwargs['margin'] = 1.0
-            y_harmonic, _ = librosa.effects.hpss(y_full, **hpss_kwargs)
+            # HPSS on entire audio for CQT only
+            hpss_kwargs = {
+                'kernel_size': int(self.hpss_kernel_size_slider.val),
+                'power': float(self.hpss_power_slider.val),
+            }
+            try:
+                hpss_kwargs['margin'] = self.hpss_margin_options[self.hpss_margin_index]
+                y_harmonic, _ = librosa.effects.hpss(y_full, **hpss_kwargs)
+            except TypeError:
+                logger.warning("Caught TypeError with string-based HPSS margin... Falling back to numeric.")
+                hpss_kwargs['margin'] = 1.0
+                y_harmonic, _ = librosa.effects.hpss(y_full, **hpss_kwargs)
 
-        # Compute CQT for the entire harmonic signal
-        cqt_data = self.cqt.compute_cqt_db(
-            y_harmonic, self.sr,
-            bins_per_octave=int(self.slider.val),
-            hop_length=int(self.hpss_hop_length_slider.val),
-            n_bins=84
-        )
-        self.cqt_data_full = cqt_data.astype(np.float32)
+            cqt_data = self.cqt.compute_cqt_db(
+                y_harmonic, sr,
+                bins_per_octave=int(self.slider.val),
+                hop_length=int(self.hpss_hop_length_slider.val),
+                n_bins=84
+            )
+            self.tracks[i]['cqt'] = cqt_data.astype(np.float32)
 
-        self.duration_sec = librosa.get_duration(y=y_full, sr=self.sr)
+        # set global sr to the first track's sr (used only for default fps calc)
+        self.sr = self.tracks[0]['sr']
+        # Seek slider max is the max duration among both tracks
+        self.duration_sec = max(self.tracks[0]['duration'], self.tracks[1]['duration'])
 
-        # Correctly set the slider's maximum value and reset its current position
         if self.seek_slider is not None:
             self._is_seeking = True
             self.seek_slider.valmax = self.duration_sec
             self.seek_slider.ax.set_xlim(self.seek_slider.valmin, self.seek_slider.valmax)
-            self.seek_slider.set_val(0.0) # Reset to the beginning
+            self.seek_slider.set_val(0.0)
             self._is_seeking = False
 
-        logger.info("Pre-processing complete. Spectrogram data is ready.")
+        logger.info("Pre-processing complete for two files. Spectrogram data ready.")
+        base_a = os.path.basename(self.tracks[0]['file'])
+        base_b = os.path.basename(self.tracks[1]['file'])
         self.ax.set_title(
-            f"{os.path.basename(self.current_file)} - BPO={int(self.slider.val)}, Hop={int(self.hpss_hop_length_slider.val)}"
+            f"A: {base_a}  |  B: {base_b}  —  BPO={int(self.slider.val)}, Hop={int(self.hpss_hop_length_slider.val)}"
         )
         self._is_processing = False
         self.fig.canvas.draw_idle()
@@ -246,55 +276,69 @@ class InteractiveCQTViewer:
         Updates the display based on the playback time and pre-computed data.
         The playhead is now fixed to the right of the viewing window.
         """
-        if self.im is None or self.fig is None or self.ax is None or self._closing or self.cqt_data_full is None or self._is_processing:
+        if self.im1 is None or self.im2 is None or self.fig is None or self.ax is None or self._closing or self._is_processing:
+            return
+        if self.tracks[0]['cqt'] is None or self.tracks[1]['cqt'] is None:
             return
 
         current_time = self._progress_thread.get_time()
-
-        # Clamp current time to the duration of the audio to prevent out-of-bounds indexing
         current_time = min(current_time, self.duration_sec)
 
         cqt_hop_length = int(self.hpss_hop_length_slider.val)
-        cqt_fps = self.sr / cqt_hop_length if self.sr else 44100 / cqt_hop_length
-        total_frames = self.cqt_data_full.shape[1]
 
-        view_width_frames = int(self.view_duration_sec * cqt_fps)
-        view_half_frames = int(view_width_frames / 2)
+        # Helper to compute rolling buffer for a track
+        def make_buffer(track_idx: int):
+            cqt_full = self.tracks[track_idx]['cqt']
+            sr_i = self.tracks[track_idx]['sr'] or 44100
+            cqt_fps_i = sr_i / cqt_hop_length
+            total_frames_i = cqt_full.shape[1]
 
-        current_frame = int(current_time * cqt_fps)
+            view_width_frames_i = int(self.view_duration_sec * cqt_fps_i)
+            view_half_frames_i = int(view_width_frames_i / 2)
+            current_frame_i = int(current_time * cqt_fps_i)
 
-        # Determine the window boundaries so the playhead is centered
-        view_start_frame = max(0, current_frame - view_half_frames)
-        view_end_frame = view_start_frame + view_width_frames
+            view_start_i = max(0, current_frame_i - view_half_frames_i)
+            view_end_i = view_start_i + view_width_frames_i
+            if view_end_i > total_frames_i:
+                view_end_i = total_frames_i
+                view_start_i = max(0, view_end_i - view_width_frames_i)
 
-        # Handle the edge case where the window would go past the end of the audio
-        if view_end_frame > total_frames:
-            view_end_frame = total_frames
-            view_start_frame = max(0, view_end_frame - view_width_frames)
+            visible_i = cqt_full[:, view_start_i:view_end_i]
+            buffer_i = np.full((cqt_full.shape[0], view_width_frames_i), -100.0)
+            start_col_i = view_width_frames_i - visible_i.shape[1]
+            buffer_i[:, start_col_i:] = visible_i
+            return buffer_i, view_width_frames_i, view_start_i, view_end_i, cqt_fps_i, current_frame_i
 
-        # Slice the pre-computed data for the visible portion
-        visible_data = self.cqt_data_full[:, view_start_frame:view_end_frame]
+        buf1, vw1, vs1, ve1, fps1, cf1 = make_buffer(0)
+        buf2, vw2, vs2, ve2, fps2, cf2 = make_buffer(1)
 
-        # Create a buffer filled with the "black" value
-        # This handles the case where visible_data is smaller than view_width_frames
-        rolling_buffer = np.full((self.cqt_data_full.shape[0], view_width_frames), -100.0)
-
-        # Calculate where to place the visible data in the buffer
-        start_col = view_width_frames - visible_data.shape[1]
-
+        # For a single x-axis, use track 0's windowing
         try:
-            rolling_buffer[:, start_col:] = visible_data
-            self.im.set_data(rolling_buffer)
-            self.im.set_clim(-80, 20)
+            self.im1.set_data(buf1)
+            self.im1.set_clim(-80, 20)
+            self.im2.set_data(buf2)
+            self.im2.set_clim(-80, 20)
 
-            # Calculate playhead position within the new window
-            playhead_pos_in_window = current_frame - view_start_frame
+            # Compute per-pixel alpha masks for sharp mix: show only the stronger spectrogram per pixel
+            if buf1.shape == buf2.shape:
+                # Strength based on dB magnitude (higher is stronger)
+                mask1 = (buf1 >= buf2)
+                mask2 = ~mask1
+                # Use 1.0/0.0 alpha for a crisp, non-averaging composite
+                self.im1.set_alpha(mask1.astype(float))
+                self.im2.set_alpha(mask2.astype(float))
+            else:
+                # If shapes mismatch (different SR/fps), fall back to equal alpha for safety
+                # Users typically have the same SR; this avoids errors if not
+                self.im1.set_alpha(0.5)
+                self.im2.set_alpha(0.5)
+
+            playhead_pos_in_window = cf1 - vs1
             self.playhead_line.set_xdata([playhead_pos_in_window, playhead_pos_in_window])
 
-            # Update the x-axis labels to reflect the current time range
-            start_time = view_start_frame / cqt_fps
-            end_time = view_end_frame / cqt_fps
-            self.ax.set_xticks(np.linspace(0, view_width_frames, 5))
+            start_time = vs1 / fps1
+            end_time = ve1 / fps1
+            self.ax.set_xticks(np.linspace(0, vw1, 5))
             self.ax.set_xticklabels([f"{t:.1f}s" for t in np.linspace(start_time, end_time, 5)])
 
             self.fig.canvas.draw_idle()
@@ -313,8 +357,11 @@ class InteractiveCQTViewer:
         view_width_frames = int(self.view_duration_sec * (44100 / initial_hop_length))
         initial_data = np.full((84, view_width_frames), -100.0)
 
-        self.im = self.ax.imshow(initial_data, aspect='auto', origin='lower', cmap='magma', animated=True, vmin=-80, vmax=20)
-        plt.colorbar(self.im, cax=self.colorbar_ax)
+        # Two overlaid images with different color schemes
+        # We'll use per-pixel alpha masks later to create a sharp mix (no averaging of colors)
+        self.im1 = self.ax.imshow(initial_data, aspect='auto', origin='lower', cmap='magma', alpha=1.0, animated=True, vmin=-80, vmax=20)
+        self.im2 = self.ax.imshow(initial_data, aspect='auto', origin='lower', cmap='twilight', alpha=0.0, animated=True, vmin=-80, vmax=20)
+        plt.colorbar(self.im1, cax=self.colorbar_ax)
 
         self.ax.set_ylabel("CQT bins")
         self.ax.set_xlabel("Time")
@@ -325,12 +372,38 @@ class InteractiveCQTViewer:
 
 
     def _ensure_mixer(self) -> bool:
-        if not _HAS_PYGAME: return False
+        if not _HAS_PYGAME:
+            return False
         try:
-            if not pygame.mixer.get_init(): pygame.mixer.init(frequency=self.sr or 44100)
+            desired_freq = int(self.sr or 44100)
+            desired_size = -16  # 16-bit signed
+            desired_channels = 2
+            cur = pygame.mixer.get_init()
+            if cur is None:
+                pygame.mixer.init(frequency=desired_freq, size=desired_size, channels=desired_channels)
+                return True
+            # cur is a tuple (frequency, format, channels)
+            cur_freq = int(cur[0])
+            cur_channels = int(cur[2])
+            if cur_freq != desired_freq or cur_channels != desired_channels:
+                # Stop any playing sound and reinitialize mixer to match desired settings
+                try:
+                    if self._channel is not None:
+                        try:
+                            self._channel.stop()
+                        except Exception:
+                            pass
+                    self._current_sound = None
+                except Exception:
+                    pass
+                try:
+                    pygame.mixer.quit()
+                except Exception:
+                    pass
+                pygame.mixer.init(frequency=desired_freq, size=desired_size, channels=desired_channels)
             return True
         except Exception:
-            logger.exception("Failed to init pygame mixer")
+            logger.exception("Failed to init/reinit pygame mixer")
             return False
 
     def _stop_playback(self):
@@ -340,11 +413,14 @@ class InteractiveCQTViewer:
         """
         if _HAS_PYGAME and pygame.mixer.get_init():
             try:
-                if pygame.mixer.music.get_busy():
-                    pygame.mixer.music.stop()
-                if hasattr(pygame.mixer.music, "unload"):
-                    pygame.mixer.music.unload()
-            except Exception: pass
+                if self._channel is not None:
+                    try:
+                        self._channel.stop()
+                    except Exception:
+                        pass
+                self._current_sound = None
+            except Exception:
+                pass
         self.is_playing = False
         self.is_paused = False
         if GUI_AVAILABLE:
@@ -352,68 +428,136 @@ class InteractiveCQTViewer:
             self._progress_thread.set_paused(False)
 
     def _play_current(self, start_sec: float = 0.0):
-        if self.cqt_data_full is None:
-            logger.warning("Spectrogram data is not ready yet. Cannot play.")
+        # Ensure spectrograms and audio buffers are ready
+        if self.tracks[0]['y_full'] is None or self.tracks[1]['y_full'] is None:
+            logger.warning("Audio not ready yet. Cannot play.")
             return
 
+        # Determine common sample rate for mixing (use first track's sr)
+        sr0 = int(self.tracks[0]['sr'] or 44100)
+        # Ensure mixer is initialized with the intended playback sample rate
+        self.sr = sr0
         if not self._ensure_mixer():
             logger.info("pygame not available; cannot play audio")
             return
+        sr1 = int(self.tracks[1]['sr'] or sr0)
+        # If sr1 != sr0, resample track 1 to sr0 for playback mixing
+        def resample_if_needed(y, srin, srout):
+            if srin == srout:
+                return y
+            # Simple high-quality resample via librosa
+            return librosa.resample(y, orig_sr=srin, target_sr=srout, res_type="kaiser_best")
 
-        # Stop any existing playback before starting a new one.
-        # This will NOT reset the progress thread's time anymore.
-        self._stop_playback()
+        y0 = self.tracks[0]['y_full']
+        y1 = resample_if_needed(self.tracks[1]['y_full'], sr1, sr0)
+        len0 = y0.shape[0]
+        len1 = y1.shape[0]
+        max_len = max(len0, len1)
 
+        # Compute start sample index
+        start_sample = max(0, int(round(float(start_sec) * sr0)))
+        if start_sample >= max_len:
+            logger.info("Start position beyond audio length; nothing to play.")
+            return
+
+        # Prepare tails from start position
+        tail0 = y0[start_sample:] if start_sample < len0 else np.zeros(0, dtype=y0.dtype)
+        tail1 = y1[start_sample:] if start_sample < len1 else np.zeros(0, dtype=y1.dtype)
+
+        # Pad shorter tail
+        L = max(tail0.shape[0], tail1.shape[0])
+        if tail0.shape[0] < L:
+            tail0 = np.pad(tail0, (0, L - tail0.shape[0]))
+        if tail1.shape[0] < L:
+            tail1 = np.pad(tail1, (0, L - tail1.shape[0]))
+
+        # Mix and normalize to int16 for pygame
+        mix = tail0.astype(np.float32) + tail1.astype(np.float32)
+        max_abs = np.max(np.abs(mix)) if mix.size else 1.0
+        if max_abs < 1e-6:
+            scale = 1.0
+        else:
+            scale = 0.8 * (32767.0 / max_abs)
+        mix_i16 = np.clip(mix * scale, -32768, 32767).astype(np.int16)
+
+        # Create Sound and play on a channel
         try:
-            pygame.mixer.music.load(self.current_file)
-            pygame.mixer.music.play(start=float(start_sec))
+            # Adapt the array shape to the mixer channel configuration
+            mixer_init = pygame.mixer.get_init()
+            mixer_channels = 2
+            if mixer_init is not None:
+                try:
+                    mixer_channels = int(mixer_init[2])
+                except Exception:
+                    mixer_channels = 2
+            if mix_i16.ndim == 1 and mixer_channels == 2:
+                # Duplicate mono to stereo for a stereo mixer
+                mix_i16 = np.ascontiguousarray(np.column_stack((mix_i16, mix_i16)))
+            elif mix_i16.ndim == 2 and mixer_channels == 1:
+                # Downmix to mono if mixer is mono (future-proofing)
+                mix_i16 = np.ascontiguousarray(mix_i16.mean(axis=1).astype(np.int16))
+            else:
+                mix_i16 = np.ascontiguousarray(mix_i16)
+
+            snd = pygame.sndarray.make_sound(mix_i16)
+            self._stop_playback()  # stop previous
+            self._current_sound = snd
+            self._channel = snd.play()
             self.is_playing = True
             self.is_paused = False
             if GUI_AVAILABLE:
                 self._progress_thread.set_playing(True)
                 self._progress_thread.set_paused(False)
         except Exception:
-            logger.exception("Failed to start playback")
+            logger.exception("Failed to start playback of mixed audio")
             self.is_playing = False
 
     def toggle_play(self, event=None):
-        if not _HAS_PYGAME or self.cqt_data_full is None: return
+        if not _HAS_PYGAME or self.tracks[0]['cqt'] is None or self.tracks[1]['cqt'] is None:
+            return
 
-        # Get the timestamp directly from the seek slider
+        # Current desired time is the seek slider value
         t = self.seek_slider.val if self.seek_slider is not None else 0.0
 
         if not self.is_playing:
             self._play_current(start_sec=t)
-            if self.play_button: self.play_button.label.set_text("Pause")
+            if self.play_button:
+                self.play_button.label.set_text("Pause")
         else:
             if not self.is_paused:
-                pygame.mixer.music.pause()
+                if self._channel is not None:
+                    try:
+                        self._channel.pause()
+                    except Exception:
+                        pass
                 self.is_paused = True
-                if GUI_AVAILABLE: self._progress_thread.set_paused(True)
-                if self.play_button: self.play_button.label.set_text("Resume")
+                if GUI_AVAILABLE:
+                    self._progress_thread.set_paused(True)
+                if self.play_button:
+                    self.play_button.label.set_text("Resume")
             else:
-                # The user is resuming after seeking while paused.
-                # The _apply_seek function already set the new time in the progress thread.
-                # We need to restart playback from that new position.
+                # Resume from current slider position (in case the user sought while paused)
                 self._play_current(start_sec=t)
-                if self.play_button: self.play_button.label.set_text("Pause")
+                if self.play_button:
+                    self.play_button.label.set_text("Pause")
 
 
     def _apply_seek(self, t_sec: float):
-        if self._is_seeking or self.cqt_data_full is None:
+        if self._is_seeking:
             return
 
         t_sec = max(0.0, min(float(t_sec), float(self.duration_sec)))
         if GUI_AVAILABLE:
             self._progress_thread.set_time(t_sec)
 
+        # If we are currently playing, we must restart mixed playback from the new position
+        if self.is_playing and not self.is_paused:
+            self._play_current(start_sec=t_sec)
+
         # Explicitly update the display here to prevent lag
         self._update_display()
 
-        logger.info("Seeking to %.2f s. No recompute needed.", t_sec)
-
-        # Do not start/stop playback here. This is a state update, not a playback command.
-        # The toggle_play function will handle starting playback if needed.
+        logger.info("Seeking to %.2f s.", t_sec)
 
     def _trigger_recompute(self):
         """Called when parameters are changed to trigger a full re-processing."""
@@ -436,7 +580,16 @@ class InteractiveCQTViewer:
         self.files = self.list_mp3()
         if not self.files:
             raise FileNotFoundError(f"No .mp3 files found in '{self.playlist_dir}'")
-        self.current_file = self._full_path(self.files[-1])
+        if len(self.files) == 1:
+            # Duplicate the only file if just one exists so UI still works
+            last = self._full_path(self.files[-1])
+            self.tracks[0]['file'] = last
+            self.tracks[1]['file'] = last
+            self.current_file = last
+        else:
+            self.tracks[0]['file'] = self._full_path(self.files[-2])
+            self.tracks[1]['file'] = self._full_path(self.files[-1])
+            self.current_file = self.tracks[1]['file']
 
         if not GUI_AVAILABLE:
             print("This script now requires an interactive GUI backend to run.")
@@ -446,7 +599,7 @@ class InteractiveCQTViewer:
 
         # Create figure and axes
         self.fig, self.ax = plt.subplots(figsize=(14, 8))
-        plt.subplots_adjust(left=0.08, right=0.92, top=0.90, bottom=0.45)
+        plt.subplots_adjust(left=0.08, right=0.88, top=0.90, bottom=0.45)
 
         # Now create sliders and buttons, so they have an axes to attach to
         ax_slider_bpo = self.fig.add_axes([0.08, 0.35, 0.40, 0.025])
@@ -494,6 +647,14 @@ class InteractiveCQTViewer:
 
             self._is_seeking = True
             t = self._progress_thread.get_time()
+            # Stop when reaching the end of the longer track
+            if t >= self.duration_sec and self.is_playing:
+                self._stop_playback()
+                if self.play_button:
+                    self.play_button.label.set_text("Play")
+                t = self.duration_sec
+                self._progress_thread.set_time(t)
+
             if self.seek_slider and abs(self.seek_slider.val - t) > 0.1:
                 self.seek_slider.set_val(t)
             self._is_seeking = False

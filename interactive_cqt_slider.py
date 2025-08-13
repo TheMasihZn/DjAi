@@ -135,7 +135,7 @@ def interactive_cqt_for_last_track(playlist_dir: str = 'playlist') -> None:
     colorbar_ref = None
 
     # Dynamic layout positions; will be adjusted after selector is decided
-    main_ax_pos = [0.08, 0.32, 0.82, 0.56]
+    main_ax_pos = [0.08, 0.32, 0.80, 0.56]
     colorbar_pos = [0.935, 0.32, 0.02, 0.56]
 
     # Wide image cache settings/state
@@ -270,13 +270,25 @@ def interactive_cqt_for_last_track(playlist_dir: str = 'playlist') -> None:
         if not _HAS_PYGAME:
             return False
         try:
-            if not pygame.mixer.get_init():
-                pygame.mixer.init()
-                # Force a single output channel to avoid overlapping sounds from other mixers
-                try:
-                    pygame.mixer.set_num_channels(1)
-                except Exception:
-                    pass
+            desired_freq = 44100
+            desired_size = -16
+            desired_channels = 2
+            cur = pygame.mixer.get_init()
+            if cur is None:
+                pygame.mixer.init(frequency=desired_freq, size=desired_size, channels=desired_channels)
+            else:
+                cur_freq, _, cur_channels = int(cur[0]), cur[1], int(cur[2])
+                if cur_freq != desired_freq or cur_channels != desired_channels:
+                    try:
+                        pygame.mixer.quit()
+                    except Exception:
+                        pass
+                    pygame.mixer.init(frequency=desired_freq, size=desired_size, channels=desired_channels)
+            # Limit to a single channel for music to avoid unexpected overlaps
+            try:
+                pygame.mixer.set_num_channels(1)
+            except Exception:
+                pass
         except Exception as e:
             print(f"[AUDIO] Failed to initialize audio mixer: {e}")
             return False
@@ -755,7 +767,7 @@ def interactive_cqt_for_last_track(playlist_dir: str = 'playlist') -> None:
         print("[UI] Dropdown selector unavailable (tkinter not accessible). Track selection via UI is disabled.")
 
     # Keep a compact layout when using a small dropdown (or when dropdown unavailable)
-    main_ax_pos = [0.08, 0.32, 0.82, 0.56]
+    main_ax_pos = [0.08, 0.32, 0.80, 0.56]
     colorbar_pos = [0.935, 0.32, 0.02, 0.56]
 
     # Draw initial plot after layout is finalized

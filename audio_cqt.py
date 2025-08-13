@@ -98,6 +98,11 @@ class CQTComputer:
             # prepare tensor on GPU
             y_t = torch.as_tensor(y_harmonic, dtype=torch.float32, device=device)
             fmin = 32.703195662574764  # consistent with librosa behavior in original code
+            # Some torchaudio versions do not provide transforms.CQT. Guard before constructing.
+            if not hasattr(getattr(torchaudio, "transforms", object()), "CQT"):
+                if self.accel_log:
+                    logger.info("torchaudio.transforms.CQT not available in this torchaudio version; skipping GPU CQT.")
+                return None, False
             try:
                 cqt = torchaudio.transforms.CQT(
                     sample_rate=sr,
@@ -109,7 +114,7 @@ class CQTComputer:
                 )
             except Exception as e:
                 if self.accel_log:
-                    logger.info("torchaudio.transforms.CQT not available or failed: %s", e)
+                    logger.info("Failed to construct torchaudio CQT: %s", e)
                 return None, False
 
             cqt = cqt.to(device)

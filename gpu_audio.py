@@ -62,6 +62,11 @@ def _gpu_cqt_db(y_harmonic: np.ndarray, sr: int, bins_per_octave: int, hop_lengt
         # torchaudio CQT transform
         # Match librosa default fmin ~ C1 ~ 32.703 Hz
         fmin = 32.703195662574764
+        # Some torchaudio versions do not provide transforms.CQT. Guard before constructing.
+        if not hasattr(getattr(torchaudio, "transforms", object()), "CQT"):
+            if _ACCEL_LOG:
+                print("[ACCEL] torchaudio.transforms.CQT not available in this torchaudio version; skipping GPU CQT.")
+            return None, False
         try:
             cqt = torchaudio.transforms.CQT(
                 sample_rate=sr,
@@ -73,7 +78,7 @@ def _gpu_cqt_db(y_harmonic: np.ndarray, sr: int, bins_per_octave: int, hop_lengt
             )
         except Exception as e:
             if _ACCEL_LOG:
-                print(f"[ACCEL] torchaudio.transforms.CQT not available or failed to construct: {e}")
+                print(f"[ACCEL] Failed to construct torchaudio CQT: {e}")
             return None, False
 
         # Ensure the module runs on GPU
