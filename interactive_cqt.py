@@ -183,7 +183,9 @@ class InteractiveCQTViewer:
 
         self.is_playing = False
         self.is_paused = False
-        self._is_processing = False  # Flag to prevent race conditions
+        self._is_processing = False  # Flag to prevent race conditions / background compute running
+        self._proc_thread: Optional[threading.Thread] = None
+        self._needs_display_refresh = False  # UI refresh requested by background compute
 
         self._is_seeking = False
 
@@ -213,72 +215,136 @@ class InteractiveCQTViewer:
     # --------------------------------
 
     def _pre_process_audio(self):
-        """Pre-process the last two audio files to generate CQT spectrograms for both."""
+        """Pre-process the last two audio files to generate CQT spectrograms for both.
+        If called on the main thread, it updates UI directly; for background use prefer _pre_process_audio_async.
+        """
         if not self.tracks[0]['file'] or not self.tracks[1]['file']:
             return
 
         self._is_processing = True
-        self.ax.set_title("Pre-processing 2 audio files... This may take a moment.")
-        self.fig.canvas.draw_idle()
-
-        # Process both tracks sequentially (simpler and safe for memory)
-        for i in range(2):
-            path = self.tracks[i]['file']
-            y_full, sr = librosa.load(path, sr=None, mono=True, res_type="kaiser_best")
-            self.tracks[i]['y_full'] = y_full
-            self.tracks[i]['sr'] = sr
-            self.tracks[i]['duration'] = librosa.get_duration(y=y_full, sr=sr)
-
-            # HPSS on entire audio for CQT only
-            hpss_kwargs = {
-                'kernel_size': int(self.hpss_kernel_size_slider.val),
-                'power': float(self.hpss_power_slider.val),
-            }
-            try:
-                hpss_kwargs['margin'] = self.hpss_margin_options[self.hpss_margin_index]
-                y_harmonic, _ = librosa.effects.hpss(y_full, **hpss_kwargs)
-            except TypeError:
-                logger.warning("Caught TypeError with string-based HPSS margin... Falling back to numeric.")
-                hpss_kwargs['margin'] = 1.0
-                y_harmonic, _ = librosa.effects.hpss(y_full, **hpss_kwargs)
-
-            cqt_data = self.cqt.compute_cqt_db(
-                y_harmonic, sr,
-                bins_per_octave=int(self.slider.val),
-                hop_length=int(self.hpss_hop_length_slider.val),
-                n_bins=84
-            )
-            self.tracks[i]['cqt'] = cqt_data.astype(np.float32)
-
-        # set global sr to the first track's sr (used only for default fps calc)
-        self.sr = self.tracks[0]['sr']
-        # Seek slider max is the max duration among both tracks
-        self.duration_sec = max(self.tracks[0]['duration'], self.tracks[1]['duration'])
-
-        if self.seek_slider is not None:
-            self._is_seeking = True
-            try:
-                self.seek_slider.valmax = self.duration_sec
-                self.seek_slider.ax.set_xlim(self.seek_slider.valmin, self.seek_slider.valmax)
-                # Preserve current time if available
-                t_restore = 0.0
+        try:
+            if self.ax is not None and self.fig is not None:
                 try:
-                    t_restore = float(self._progress_thread.get_time()) if GUI_AVAILABLE else 0.0
+                    self.ax.set_title("Pre-processing 2 audio files... This may take a moment.")
+                    self.fig.canvas.draw_idle()
                 except Exception:
-                    t_restore = 0.0
-                t_restore = max(0.0, min(float(t_restore), float(self.duration_sec)))
-                self.seek_slider.set_val(t_restore)
-            finally:
-                self._is_seeking = False
+                    pass
 
-        logger.info("Pre-processing complete for two files. Spectrogram data ready.")
-        base_a = os.path.basename(self.tracks[0]['file'])
-        base_b = os.path.basename(self.tracks[1]['file'])
-        self.ax.set_title(
-            f"A: {base_a}  |  B: {base_b}  —  BPO={int(self.slider.val)}, Hop={int(self.hpss_hop_length_slider.val)}"
-        )
-        self._is_processing = False
-        self.fig.canvas.draw_idle()
+            # Process both tracks sequentially (simpler and safe for memory)
+            for i in range(2):
+                path = self.tracks[i]['file']
+                y_full, sr = librosa.load(path, sr=None, mono=True, res_type="kaiser_best")
+                self.tracks[i]['y_full'] = y_full
+                self.tracks[i]['sr'] = sr
+                self.tracks[i]['duration'] = librosa.get_duration(y=y_full, sr=sr)
+
+                # HPSS on entire audio for CQT only
+                hpss_kwargs = {
+                    'kernel_size': int(self.hpss_kernel_size_slider.val),
+                    'power': float(self.hpss_power_slider.val),
+                }
+                try:
+                    hpss_kwargs['margin'] = self.hpss_margin_options[self.hpss_margin_index]
+                    y_harmonic, _ = librosa.effects.hpss(y_full, **hpss_kwargs)
+                except TypeError:
+                    logger.warning("Caught TypeError with string-based HPSS margin... Falling back to numeric.")
+                    hpss_kwargs['margin'] = 1.0
+                    y_harmonic, _ = librosa.effects.hpss(y_full, **hpss_kwargs)
+
+                cqt_data = self.cqt.compute_cqt_db(
+                    y_harmonic, sr,
+                    bins_per_octave=int(self.slider.val),
+                    hop_length=int(self.hpss_hop_length_slider.val),
+                    n_bins=84
+                )
+                self.tracks[i]['cqt'] = cqt_data.astype(np.float32)
+
+            # set global sr to the first track's sr (used only for default fps calc)
+            self.sr = self.tracks[0]['sr']
+            # Seek slider max is the max duration among both tracks
+            self.duration_sec = max(self.tracks[0]['duration'], self.tracks[1]['duration'])
+
+            # UI updates (only safe on main thread; guarded so background thread can skip drawing)
+            if self.seek_slider is not None:
+                self._is_seeking = True
+                try:
+                    self.seek_slider.valmax = self.duration_sec
+                    self.seek_slider.ax.set_xlim(self.seek_slider.valmin, self.seek_slider.valmax)
+                    # Preserve current time if available
+                    t_restore = 0.0
+                    try:
+                        t_restore = float(self._progress_thread.get_time()) if GUI_AVAILABLE else 0.0
+                    except Exception:
+                        t_restore = 0.0
+                    t_restore = max(0.0, min(float(t_restore), float(self.duration_sec)))
+                    self.seek_slider.set_val(t_restore)
+                finally:
+                    self._is_seeking = False
+
+            logger.info("Pre-processing complete for two files. Spectrogram data ready.")
+            if self.ax is not None and self.fig is not None:
+                try:
+                    base_a = os.path.basename(self.tracks[0]['file'])
+                    base_b = os.path.basename(self.tracks[1]['file'])
+                    self.ax.set_title(
+                        f"A: {base_a}  |  B: {base_b}  —  BPO={int(self.slider.val)}, Hop={int(self.hpss_hop_length_slider.val)}"
+                    )
+                    self.fig.canvas.draw_idle()
+                except Exception:
+                    pass
+        finally:
+            self._is_processing = False
+
+    def _pre_process_audio_async(self):
+        """Run pre-processing in a background thread to keep GUI responsive."""
+        if self._is_processing or (self._proc_thread and self._proc_thread.is_alive()):
+            return
+        self._is_processing = True
+        def _worker():
+            try:
+                # Heavy compute without touching GUI
+                for i in range(2):
+                    path = self.tracks[i]['file']
+                    y_full, sr = librosa.load(path, sr=None, mono=True, res_type="kaiser_best")
+                    self.tracks[i]['y_full'] = y_full
+                    self.tracks[i]['sr'] = sr
+                    self.tracks[i]['duration'] = librosa.get_duration(y=y_full, sr=sr)
+
+                    hpss_kwargs = {
+                        'kernel_size': int(self.hpss_kernel_size_slider.val),
+                        'power': float(self.hpss_power_slider.val),
+                    }
+                    try:
+                        hpss_kwargs['margin'] = self.hpss_margin_options[self.hpss_margin_index]
+                        y_harmonic, _ = librosa.effects.hpss(y_full, **hpss_kwargs)
+                    except TypeError:
+                        hpss_kwargs['margin'] = 1.0
+                        y_harmonic, _ = librosa.effects.hpss(y_full, **hpss_kwargs)
+
+                    cqt_data = self.cqt.compute_cqt_db(
+                        y_harmonic, sr,
+                        bins_per_octave=int(self.slider.val),
+                        hop_length=int(self.hpss_hop_length_slider.val),
+                        n_bins=84
+                    )
+                    self.tracks[i]['cqt'] = cqt_data.astype(np.float32)
+
+                self.sr = self.tracks[0]['sr']
+                self.duration_sec = max(self.tracks[0]['duration'], self.tracks[1]['duration'])
+
+                logger.info("Pre-processing complete for two files (background).")
+                self._needs_display_refresh = True
+            finally:
+                self._is_processing = False
+        # Indicate processing on UI (title) without blocking
+        if self.ax is not None and self.fig is not None:
+            try:
+                self.ax.set_title("Pre-processing 2 audio files... This may take a moment.")
+                self.fig.canvas.draw_idle()
+            except Exception:
+                pass
+        self._proc_thread = threading.Thread(target=_worker, name="PreProcessThread", daemon=True)
+        self._proc_thread.start()
 
     def _update_display(self):
         """
@@ -590,8 +656,8 @@ class InteractiveCQTViewer:
         # Stop playback without resetting time
         self._stop_playback()
 
-        # Recompute
-        self._pre_process_audio()
+        # Recompute asynchronously to keep GUI responsive
+        self._pre_process_audio_async()
 
         # Clamp time to new duration and restore
         cur_time = max(0.0, min(float(cur_time), float(self.duration_sec)))
@@ -693,11 +759,38 @@ class InteractiveCQTViewer:
         self.hpss_margin_button.on_clicked(_on_margin_button_click)
         self.seek_slider.on_changed(lambda val: self._apply_seek(val))
 
-        # Start the pre-processing
-        self._pre_process_audio()
+        # Start the pre-processing asynchronously
+        self._pre_process_audio_async()
 
         def _timer_cb():
             if self._closing: return
+
+            # Apply UI updates requested by background processing
+            if self._needs_display_refresh and not self._is_processing:
+                try:
+                    if self.seek_slider is not None:
+                        self._is_seeking = True
+                        try:
+                            self.seek_slider.valmax = self.duration_sec
+                            self.seek_slider.ax.set_xlim(self.seek_slider.valmin, self.seek_slider.valmax)
+                            t_restore = 0.0
+                            try:
+                                t_restore = float(self._progress_thread.get_time()) if GUI_AVAILABLE else 0.0
+                            except Exception:
+                                t_restore = 0.0
+                            t_restore = max(0.0, min(float(t_restore), float(self.duration_sec)))
+                            self.seek_slider.set_val(t_restore)
+                        finally:
+                            self._is_seeking = False
+                    if self.ax is not None:
+                        base_a = os.path.basename(self.tracks[0]['file'])
+                        base_b = os.path.basename(self.tracks[1]['file'])
+                        self.ax.set_title(
+                            f"A: {base_a}  |  B: {base_b}  —  BPO={int(self.slider.val)}, Hop={int(self.hpss_hop_length_slider.val)}"
+                        )
+                    self._needs_display_refresh = False
+                except Exception:
+                    self._needs_display_refresh = False
 
             self._is_seeking = True
             t = self._progress_thread.get_time()
